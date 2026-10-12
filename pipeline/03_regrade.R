@@ -1,19 +1,11 @@
-# =====================================================================================
 # 03_regrade.R
-# Run after 02_build_models.R, from the same working directory. Retrains nothing.
-#   - builds a larger reference set per pitch type x platoon side: real pitches' location, count and
-#     pitch-to-pitch deviation from their own pitcher's average shape
-#   - removes the reference set's sampling offset against a much larger sample
-#   - regrades every pitcher-season-pitch, sets the colour scale (all pitches, straight L/R average)
-#   - writes app_artifacts/app_data.rds, the single data file the app needs besides grader.txt
-# Output to paste back: model_out/regrade_report.txt
-# =====================================================================================
+
 PREP_FILE <- "model_out/prep.rds"
 ART_DIR   <- "app_artifacts"
 OUT_DIR   <- "model_out"
-K_APP     <- 1000      # reference pitches per pitch type x platoon side used live in the app
-N_BIG     <- 40000     # large sample used once here to calibrate the K_APP set
-MIN_CELL  <- 50        # pitcher-season-pitch cells smaller than this are not used for deviations
+K_APP     <- 1000
+N_BIG     <- 40000
+MIN_CELL  <- 50
 SEED      <- 42
 
 suppressPackageStartupMessages({ library(data.table); library(lightgbm) })
@@ -39,7 +31,7 @@ STUFF <- c("release_speed", "hb_arm", "ivb", "release_extension", "arm_angle", "
 supported <- c(STUFF, "velo_diff", "hb_diff", "ivb_diff", "is_fb", "same_hand", "is_lhp", "balls", "strikes", "px_bat", "pz_norm", names(BM))
 if (!all(GF %in% supported)) stop("Grader uses features this script does not rebuild: ", paste(setdiff(GF, supported), collapse = ", "))
 
-# ------------------------------- reference pitches ----------------------------------
+# reference pitches
 tick("loading ", PREP_FILE)
 sc <- readRDS(PREP_FILE)$sc; setDT(sc)
 sc <- sc[, c("pitcher", "game_year", "pt", "same_hand", "px_bat", "pz_norm", "balls", "strikes", STUFF), with = FALSE]; gc()
@@ -82,7 +74,7 @@ grade_block <- function(shapes, pool, same_hand, chunk = 150L) {
   out
 }
 
-# ------------------------------- defaults, ranges ------------------------------------
+# defaults & ranges
 ST[, is_lhp := as.numeric(p_throws == "L")]
 cmean <- function(a, w) (atan2(sum(w * sin(a * pi / 180)), sum(w * cos(a * pi / 180))) * 180 / pi) %% 360
 D0 <- ST[n >= 100 & !is.na(active_spin) & is.finite(arm_angle)]
@@ -95,19 +87,19 @@ ax  <- D0[, { c0 <- cmean(axis_m, n); u <- ((axis_m - c0 + 180) %% 360) - 180 + 
               .(var = "axis_m", lo = quantile(u, QR[1]), hi = quantile(u, QR[2])) }, by = pt]
 ranges <- rbind(rng, ax)
 
-base_shape <- function(p, lhp) {          # the app's opening state: league-average pitch, graded off a league-average four-seamer
+base_shape <- function(p, lhp) {
   d <- defaults[pt == p & is_lhp == lhp]; f <- defaults[pt == "FF" & is_lhp == lhp]
-  if (!nrow(d)) d <- defaults[pt == p][1]                 # a type with no qualifying pitchers of that hand borrows the other hand
+  if (!nrow(d)) d <- defaults[pt == p][1]
   data.table(pt = p, is_lhp = lhp, d[, STUFF, with = FALSE], fb_velo = f$release_speed, fb_hb = f$hb_arm, fb_ivb = f$ivb, is_fb = as.numeric(p == "FF"))
 }
 
-# ------------------------------- offsets + check -------------------------------------
+# offsets & checks
 tick("calibrating the ", K_APP, "-pitch reference sets")
 off <- CJ(pt = PT, same_hand = 0:1, is_lhp = 0:1)
 off[, c("big", "app") := { b <- base_shape(pt, is_lhp); kk <- key(pt, same_hand)
                            .(grade_block(b, poolB[[kk]], same_hand), grade_block(b, poolA[[kk]], same_hand)) }, by = .(pt, same_hand, is_lhp)]
 off[, offset := big - app]
-grade_app <- function(shapes, h) {         # exactly what the app computes
+grade_app <- function(shapes, h) {
   o <- off[.(shapes$pt, h, shapes$is_lhp), on = .(pt, same_hand, is_lhp), offset]; g <- numeric(nrow(shapes))
   for (p in unique(shapes$pt)) { i <- which(shapes$pt == p); g[i] <- grade_block(shapes[i], poolA[[key(p, h)]], h) }
   g + o
@@ -124,12 +116,12 @@ chk[, `:=`(a0 = grade_app(chk, 0), a1 = grade_app(chk, 1), b0 = grade_big(chk, 0
 
 tick("regrading ", nrow(R), " pitcher-season-pitch shapes")
 R[, `:=`(g_opp = grade_app(R, 0), g_same = grade_app(R, 1))]
-R[, g_avg := (g_opp + g_same) / 2]                                   # straight average of the two batter sides
+R[, g_avg := (g_opp + g_same) / 2]
 sc_all <- R[n >= 100, .(mu = weighted.mean(g_avg, n), sd = sqrt(sum(n * (g_avg - weighted.mean(g_avg, n))^2) / sum(n)))]
 plus <- function(x) 100 - 10 * (x - sc_all$mu) / sc_all$sd
 R[, `:=`(plus_new = plus(g_avg), plus_vsR = plus(fifelse(is_lhp == 1, g_opp, g_same)), plus_vsL = plus(fifelse(is_lhp == 1, g_same, g_opp)))]
 
-# ------------------------------- report ----------------------------------------------
+# report
 hdr("1. REFERENCE SETS")
 say("Reference pitches per pitch type x platoon side: app ", K_APP, ", calibration up to ", N_BIG, ". Grader features: ", length(GF))
 emit("Pitch-to-pitch SD around a pitcher's own average (what the scatter adds):"); shw(dev_sd, 2)
@@ -168,7 +160,7 @@ for (z in list(list("ST", "hb_arm", seq(-22, -6, .5)), list("FF", "release_speed
 b <- base_shape("SL", 0); tm <- system.time(for (i in 1:10) { grade_block(b, poolA[["SL 0"]], 0); grade_block(b, poolA[["SL 1"]], 1) })[["elapsed"]] / 10
 say("One app update (both batter sides): ", round(1000 * tm), " ms")
 
-# ------------------------------- app bundle ------------------------------------------
+# app bundle
 L  <- readRDS(file.path(ART_DIR, "movement_lm.rds")); tt <- delete.response(terms(L$hb))
 cf <- function(m) { b <- coef(m); b[is.na(b)] <- 0; b }
 dfl <- function(d) as.data.frame(d)
