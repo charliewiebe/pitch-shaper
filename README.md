@@ -2,17 +2,17 @@
 
 An R Shiny app for exploring how spin and release traits shape a pitch's movement and its graded quality.
 
-**Open the app:** https://YOUR-APP-LINK
+**Open the app:** https://01a131f5-80c8-7107-fb34-61a3a8060255.share.connect.posit.cloud/
 
 **Portfolio:** https://charliewiebe.github.io
 
-Choose a pitch type, or start from any MLB pitcher's arsenal, then move the sliders for velocity, spin rate, spin direction, active spin, arm angle, release height and extension. The app predicts the pitch's induced vertical break (IVB) and horizontal break (HB), plots it among real MLB pitches, and grades it against right- and left-handed batters. The background dots are measured MLB pitcher-season averages, colored on the same grade scale.
+Choose a pitch type, or start from any MLB pitcher's arsenal, then move the sliders for velocity, spin rate, spin direction, active spin, arm angle, release height and extension. The app predicts the pitch's induced vertical break (IVB) and horizontal break (HB), plots it against real MLB pitches, and grades it against right- and left-handed batters. The background dots are measured MLB pitcher-season averages, colored on the same grade scale.
 
 The app runs on a free hosting tier that sleeps when idle, so the first load can take up to a minute.
 
 ## How it works
 
-The app chains two models: the sliders feed an expected movement model, and its predicted movement (with velocity and release traits) feeds the pitch grader. A third model builds the grader's target. All three are trained on about 2.8 million pitches of public Statcast data, 2023 through 2026.
+The app connects two core models: the sliders feed an expected movement model, and its predicted movement (with velocity and release traits) feeds the pitch grader. A third model builds the grader's target. All three are trained on about 2.8 million pitches of public Statcast data, 2023 through 2026.
 
 **1. Expected run value (the grader's target).** Each pitch's run value is replaced with an expected value to strip out noise. Balls, called strikes, whiffs and fouls get the average run value of that outcome in that count. Balls in play get a gradient-boosted estimate from exit velocity, launch angle and count (out-of-fold R² 0.43 against Statcast's `delta_run_exp`; correlation 0.97 with Savant's xwOBA).
 
@@ -20,17 +20,12 @@ The app chains two models: the sliders feed an expected movement model, and its 
 
 To grade a pitch independent of where it was thrown, the app scores it against a reference set of 1,000 real pitches per pitch type and platoon side, each with its own location, count, batter and pitch-to-pitch scatter, and averages the predictions. Grades are scaled so 100 is the average MLB pitch and 10 points is one standard deviation. The dot's color is the straight average of the grades against right- and left-handed batters.
 
-**3. Expected movement model.** A linear model with pitch-type interactions predicts IVB and HB from season-level spin and release traits. Its features follow the physics of the Magnus effect: the horizontal and vertical components of active spin, computed from spin rate, active spin percentage and spin direction. Cross-validated with pitchers grouped into folds, it reaches R² 0.98 for HB and 0.97 for IVB, with errors of about 1.4 inches. Grip and seam effects are not modeled yet.
-
-**Validation highlights** (from `reports/model_report.txt`)
-
-- On pitchers held out of training, a pitch's grade predicts that pitch's next-season expected run value (r = 0.34) slightly better than the pitch's own current-season results do (r = 0.31).
-- Some useful grader inputs are left out on purpose so the grader stays compatible with the movement model's sliders, including break velocity, pitch sequencing and pitch-to-pitch variance.
+**3. Expected movement model.** A linear model with pitch-type interactions predicts IVB and HB from season-level spin and release traits. Its features follow the physics of the Magnus effect: the horizontal and vertical components of active spin, computed from spin rate, active spin percentage and spin direction. Cross-validated with pitchers grouped into folds, it reaches R² 0.98 for HB and 0.97 for IVB. Grip and seam effects are not modeled yet.
 
 ## Repository layout
 
 ```
-app.R                          the Shiny app
+app.R                          Shiny app
 manifest.json                  package list for Posit Connect Cloud
 app_artifacts/
   app_data.rds                 reference sets, movement model coefficients, slider ranges
