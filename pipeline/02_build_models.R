@@ -1,39 +1,29 @@
-# =====================================================================================
 # 02_build_models.R
-# Full modelling pipeline. Run from the same working directory as script 01.
-#   1. Pitch table: outcome classes, expected run value (xRV), batter quality, engineered features
-#   2. Season table (pitcher x season x pitch type) + active spin + cross-check vs pitch_traits CSV
-#   3. Movement model  : season level   sliders -> HB / IVB
-#   4. Pitch grader    : pitch level    velo + movement + release + arsenal + location/count/batter -> xRV
-#   5. Location-neutral grades, sanity checks, artifacts for the app
-# Outputs: model_out/model_report.txt (paste this back), app_artifacts/*
-# Set QUICK <- TRUE for a ~1/8-sample dry run before the full run.
-# =====================================================================================
 
-# ----------------------------------- CONFIG -----------------------------------------
+# config
 QUICK      <- FALSE
 SEASONS    <- 2023:2026
 RAW_FILE   <- "statcast_data/statcast_raw_2023_2026.rds"
-CSV_DIR    <- c(".", "Downloads", "~/Downloads")   # searched in order; data frames already loaded under the same names are used first
+CSV_DIR    <- c(".", "Downloads", "~/Downloads")
 OUT_DIR    <- "model_out"
 ART_DIR    <- "app_artifacts"
-USE_CACHE  <- TRUE                   # reuse the prepared pitch table on reruns
+USE_CACHE  <- TRUE
 SEED       <- 42
 NTHREAD    <- max(1L, parallel::detectCores() - 1L)
 
-PT_KEEP    <- c("FF", "SI", "FC", "SL", "ST", "SV", "CU", "CH", "FS")   # KC/CS folded into CU (as Savant does)
-MIN_N_MOVE <- 50                     # min pitches per pitcher-season-pitch for the movement model
-FB_MIN     <- 30                     # min pitches for a primary-fastball reference
-VAL_FRAC   <- 0.15                   # share of pitchers held out for the grader
-K_REF      <- 300                    # reference (location, count) draws per pitch type x platoon
-MOVE_SET   <- "M3"                   # movement feature set saved for the app (see MOVE_SETS)
-GRADER_VARIANT <- "auto"             # "auto" = lowest held-out MSE among V0..V3, or name one
+PT_KEEP    <- c("FF", "SI", "FC", "SL", "ST", "SV", "CU", "CH", "FS")
+MIN_N_MOVE <- 50
+FB_MIN     <- 30 
+VAL_FRAC   <- 0.15
+K_REF      <- 300
+MOVE_SET   <- "M3"
+GRADER_VARIANT <- "auto"
 
 SCALE <- if (QUICK) 1 / 8 else 1
-if (QUICK) { OUT_DIR <- paste0(OUT_DIR, "_quick"); ART_DIR <- paste0(ART_DIR, "_quick") }   # a dry run never overwrites real artifacts
+if (QUICK) { OUT_DIR <- paste0(OUT_DIR, "_quick"); ART_DIR <- paste0(ART_DIR, "_quick") }
 thr   <- function(x) max(5, round(x * SCALE))
 
-# ----------------------------------- SETUP ------------------------------------------
+# setup
 pkgs <- c("data.table", "lightgbm")
 new  <- pkgs[!vapply(pkgs, requireNamespace, logical(1), quietly = TRUE)]
 if (length(new)) install.packages(new)
@@ -95,9 +85,7 @@ local({                                              # 5-second API smoke test b
 })
 tick("lightgbm ", as.character(packageVersion("lightgbm")), " smoke test passed")
 
-# =====================================================================================
-# 1. PITCH TABLE
-# =====================================================================================
+# pitch table
 BAT_FEATS <- c("b_xwoba", "b_whiff", "b_chase", "b_xwobacon")
 PREP_FILE <- file.path(OUT_DIR, if (QUICK) "prep_quick.rds" else "prep.rds")
 
@@ -136,7 +124,7 @@ if (USE_CACHE && file.exists(PREP_FILE)) {
     if (!is.integer(sc[[cc]])) set(sc, j = cc, value = suppressWarnings(as.integer(sc[[cc]])))
   info <- list(n_raw = nrow(sc))
 
-  # ---- outcome classes ----
+  # outcome classes
   oc_map <- c(ball = "ball", blocked_ball = "ball", pitchout = "ball", called_strike = "cs",
               swinging_strike = "whiff", swinging_strike_blocked = "whiff", foul_tip = "whiff", swinging_pitchout = "whiff",
               foul = "foul", foul_pitchout = "foul", foul_bunt = "bunt", bunt_foul_tip = "bunt", missed_bunt = "bunt",
@@ -145,7 +133,7 @@ if (USE_CACHE && file.exists(PREP_FILE)) {
   sc <- sc[!is.na(oc) & !is.na(delta_run_exp) & balls <= 3 & strikes <= 2]
   info$n_outcome <- nrow(sc)
 
-  # ---- xRV: count-level run value for non-BIP, batted-ball model for BIP ----
+
   crv <- sc[oc != "bip", .(rv = mean(delta_run_exp), n = .N), by = .(balls, strikes, oc)]
   sc[crv, on = .(balls, strikes, oc), xrv := i.rv]
   tick("fitting batted-ball run value model (5-fold out-of-fold)")
@@ -166,24 +154,24 @@ if (USE_CACHE && file.exists(PREP_FILE)) {
   sc[oc == "bip" & is.na(xrv), xrv := bip_m]; sc[, bip_m := NULL]
   rm(Xb, yb, oof, fold, ok); gc()
 
-  # ---- geometry + flags ----
+  # geometry & flags
   sc[, sgn  := fifelse(p_throws == "R", 1, -1)]
   sc[, bsgn := fifelse(stand == "R", 1, -1)]
-  sc[, `:=`(hb_arm    = -12 * pfx_x * sgn,                     # + = arm side
+  sc[, `:=`(hb_arm    = -12 * pfx_x * sgn,
             ivb       = 12 * pfx_z,
             rel_x_arm = -release_pos_x * sgn,
-            axis_m    = 180 + sgn * (spin_axis - 180),          # LHP mirrored
+            axis_m    = 180 + sgn * (spin_axis - 180),
             same_hand = as.numeric(stand == p_throws),
             is_lhp    = as.numeric(p_throws == "L"),
-            px_bat    = plate_x * bsgn,                         # - = inside to the batter
-            pz_norm   = (plate_z - sz_bot) / (sz_top - sz_bot), # 0 = bottom of zone, 1 = top (per-season zone)
+            px_bat    = plate_x * bsgn,
+            pz_norm   = (plate_z - sz_bot) / (sz_top - sz_bot),
             swing     = description %in% c("swinging_strike", "swinging_strike_blocked", "foul", "foul_tip", "hit_into_play"),
             whiff     = oc == "whiff",
             in_zone   = fifelse(is.na(zone), NA, zone <= 9L))]
   sc[(sz_top - sz_bot) < 0.5, pz_norm := NA_real_]
   sc[, pt := pitch_type]; sc[pitch_type %in% c("KC", "CS"), pt := "CU"]
 
-  # ---- batter quality (season, shrunk to league) ----
+  # batter quality
   sc[, xw := fifelse(is.na(estimated_woba_using_speedangle), woba_value, estimated_woba_using_speedangle)]
   bat <- sc[, .(pa = sum(woba_denom == 1, na.rm = TRUE), xw_sum = sum(xw[woba_denom == 1], na.rm = TRUE),
                 sw = sum(swing), wh = sum(whiff),
@@ -200,12 +188,12 @@ if (USE_CACHE && file.exists(PREP_FILE)) {
   sc[bat, on = .(batter, game_year), (BAT_FEATS) := mget(paste0("i.", BAT_FEATS))]
   sc[, xw := NULL]
 
-  # ---- modelling rows ----
+  # modeling rows
   sc <- sc[pt %in% PT_KEEP & !is.na(release_speed) & !is.na(hb_arm) & !is.na(ivb) & !is.na(px_bat) & !is.na(pz_norm)]
   info$n_model <- nrow(sc)
   bat_means <- as.list(sc[, lapply(.SD, mean, na.rm = TRUE), .SDcols = BAT_FEATS])
 
-  # ---- pitcher-season-pitch aggregates, primary fastball, league reference ----
+
   agg <- sc[, .(n = .N, player_name = player_name[1], p_throws = p_throws[1], is_lhp = is_lhp[1],
                 release_speed = mean(release_speed), release_spin_rate = mean(release_spin_rate, na.rm = TRUE),
                 hb_arm = mean(hb_arm), ivb = mean(ivb),
@@ -250,10 +238,8 @@ sec("1. EXPECTED RUN VALUE (xRV) TARGET", {
   shw(sc[, lapply(.SD, function(x) c(mean(x, na.rm = TRUE), sd(x, na.rm = TRUE), min(x, na.rm = TRUE), max(x, na.rm = TRUE))), .SDcols = BAT_FEATS][, stat := c("mean", "sd", "min", "max")], 4)
 })
 
-# =====================================================================================
-# 2. SEASON TABLE + ACTIVE SPIN + CSV CROSS-CHECK
-# =====================================================================================
-get_csv <- function(name) {           # workspace object of that name if loaded, otherwise the first matching file
+# season table + active spin + cross-check
+get_csv <- function(name) {
   if (exists(name, envir = globalenv()) && is.data.frame(get(name, envir = globalenv()))) return(as.data.table(get(name, envir = globalenv())))
   f <- file.path(CSV_DIR, paste0(name, ".csv")); f <- f[file.exists(f)]
   if (!length(f)) stop(name, ".csv not found in: ", paste(CSV_DIR, collapse = ", "), " (working directory ", getwd(), ")")
@@ -300,9 +286,7 @@ sec("2. SEASON TABLE AND CSV CROSS-CHECK", {
   shw(cc[, .(n = .N, mean_diff_ivb = mean(ivb - csv_ivb), mean_diff_hb = mean(hb_arm - csv_hb_arm)), by = pt][order(-n)], 3)
 })
 
-# =====================================================================================
-# 3. MOVEMENT MODEL (season level): sliders -> HB, IVB
-# =====================================================================================
+# movement model
 M <- S[!is.na(active_spin) & n >= thr(MIN_N_MOVE) & is.finite(axis_m) & is.finite(release_spin_rate) & is.finite(arm_angle) &
          is.finite(release_extension) & is.finite(release_pos_z) & is.finite(rel_x_arm)]
 add_move_feats <- function(d) {           # everything here is a deterministic function of the sliders
@@ -388,9 +372,7 @@ sec("3. MOVEMENT MODEL (pitcher-grouped 5-fold CV, weights = min(n, 500))", {
              .(player_name, game_year, pt, n, active_spin, axis_m, hb_arm, hb_oof, ivb, ivb_oof, col_share)], 15), 1)
 })
 
-# =====================================================================================
-# 4. PITCH GRADER (pitch level)
-# =====================================================================================
+# pitch grader (pitch level)
 F_STUFF <- c("release_speed", "hb_arm", "ivb", "release_extension", "arm_angle", "release_pos_z")
 F_ARS   <- c("velo_diff", "hb_diff", "ivb_diff", "is_fb")
 F_CTX   <- c("same_hand", "is_lhp", "balls", "strikes", "px_bat", "pz_norm", BAT_FEATS)
@@ -425,9 +407,9 @@ train_grader <- function(tag, feats) {
 }
 for (v in names(VARIANTS)) train_grader(v, VARIANTS[[v]])
 cand <- c("V0_raw", "V1_type", "V2_z", "V3_type_z")
-d_mse <- function(v) mean(se_val[[v]] - se_val[["V0_raw"]])                       # paired difference in held-out MSE vs V0
+d_mse <- function(v) mean(se_val[[v]] - se_val[["V0_raw"]])
 d_se  <- function(v) sd(se_val[[v]] - se_val[["V0_raw"]]) / sqrt(length(yv))
-best  <- "V0_raw"                                                                # simplest model unless a richer one is clearly better
+best  <- "V0_raw"
 if (GRADER_VARIANT == "auto") {
   dz <- sapply(setdiff(cand, "V0_raw"), function(v) d_mse(v) / d_se(v))
   if (any(dz < -2)) best <- names(dz)[which.min(sapply(names(dz), d_mse) + ifelse(dz < -2, 0, Inf))]
@@ -457,9 +439,7 @@ sec("4. PITCH GRADER (target = xRV per pitch; 15% of pitchers held out)", {
         .(n = .N, pred_xrv100 = 100 * mean(p), mean_xrv100 = 100 * mean(y), mean_actual_rv100 = 100 * mean(a)), by = dec][order(dec)], 3)
 })
 
-# =====================================================================================
-# 5. LOCATION-NEUTRAL GRADES
-# =====================================================================================
+# location-neutral grades
 loc_ref <- sc[, .SD[sample(.N, min(.N, K_REF))], by = .(pt, same_hand), .SDcols = c("px_bat", "pz_norm", "balls", "strikes")]
 plat    <- sc[, .(same_share = mean(same_hand)), by = .(pt, is_lhp)]
 
@@ -490,7 +470,7 @@ scale_pt  <- ref_rows[, .(mu = weighted.mean(g_xrv100, n), sd = sqrt(sum(n * (g_
 S[, grade_plus := 100 - 10 * (g_xrv100 - scale_all$mu) / scale_all$sd]       # 100 = average pitch, +10 = 1 SD better
 S[, is_heldout := pitcher %in% vp]
 
-# chain check: grade from predicted (out-of-fold) movement vs grade from actual movement
+
 C <- M[, c("pitcher", "game_year", "pt", "is_lhp", "n", F_STUFF, "rel_x_arm", "fb_velo", "fb_hb", "fb_ivb", "is_fb", "hb_oof", "ivb_oof"), with = FALSE]
 C[, `:=`(hb_arm = hb_oof, ivb = ivb_oof)]; add_eng(C)
 gc_ <- grade_shapes(C); C[, g_pred_move := overall(C, gc_)]
@@ -545,9 +525,7 @@ sec("5. LOCATION-NEUTRAL GRADES (xRV per 100 pitches at reference locations; low
             sweep1("FS", "ivb", seq(-6, 9, 3))), 3)
 })
 
-# =====================================================================================
-# 6. ARTIFACTS
-# =====================================================================================
+# artifacts
 cq <- function(x, pr) { c0 <- (atan2(mean(sin(x * pi / 180)), mean(cos(x * pi / 180))) * 180 / pi) %% 360   # quantiles of a circular variable
                          (quantile(((x - c0 + 180) %% 360) - 180, pr, names = FALSE) + c0) %% 360 }
 sl_vars <- c("release_speed", "release_spin_rate", "active_spin", "arm_angle", "release_extension", "release_pos_z", "rel_x_arm", "hb_arm", "ivb")
