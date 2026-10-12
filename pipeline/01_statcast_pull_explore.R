@@ -1,24 +1,17 @@
-# =====================================================================================
 # 01_statcast_pull_explore.R
-# Step 1 of the pitch-grade / movement Shiny pipeline:
-#   (A) pull pitch-level Statcast from Baseball Savant (chunked, cached, resumable)
-#   (B) derive a handful of exploration-only features
-#   (C) write a text EDA report + a few PNGs to eda_out/
-# Paste eda_out/statcast_eda_report.txt back (and the PNGs if convenient).
-# =====================================================================================
 
-# ----------------------------------- CONFIG -----------------------------------------
+# config
 SEASONS     <- 2023:2026
-GAME_TYPES  <- c("R")            # R = regular season; add "F","D","L","W" for postseason
-CHUNK_DAYS  <- 3                 # days per Savant request (auto-splits if the row cap is hit)
-ROW_CAP     <- 25000             # Savant truncates a single CSV at this many rows
-SLEEP_SEC   <- 1                 # pause between requests
-REFRESH     <- FALSE             # TRUE = ignore the combined file and rebuild from chunks/web
+GAME_TYPES  <- c("R")
+CHUNK_DAYS  <- 3 
+ROW_CAP     <- 25000
+SLEEP_SEC   <- 1  
+REFRESH     <- FALSE
 DATA_DIR    <- "statcast_data"
 OUT_DIR     <- "eda_out"
 SEED        <- 42
 
-# ----------------------------------- SETUP ------------------------------------------
+# setup
 pkgs <- c("data.table", "httr", "ggplot2")
 new  <- pkgs[!vapply(pkgs, requireNamespace, logical(1), quietly = TRUE)]
 if (length(new)) install.packages(new)
@@ -31,9 +24,7 @@ dir.create(OUT_DIR,   recursive = TRUE, showWarnings = FALSE)
 set.seed(SEED)
 t_start <- Sys.time()
 
-# =====================================================================================
-# (A) PULL
-# =====================================================================================
+# pull
 UA <- "Mozilla/5.0 (statcast research pull; R httr)"
 
 savant_url <- function(start, end, season, game_types = GAME_TYPES) {
@@ -74,7 +65,7 @@ pull_range <- function(start, end, season) {
   if (file.exists(f)) return(readRDS(f))
   dt <- fetch_chunk(start, end, season)
   Sys.sleep(SLEEP_SEC)
-  if (nrow(dt) >= ROW_CAP && end > start) {            # truncated -> split and retry
+  if (nrow(dt) >= ROW_CAP && end > start) { 
     mid <- start + as.integer(end - start) %/% 2L
     return(rbindlist(list(pull_range(start, mid, season), pull_range(mid + 1L, end, season)),
                      use.names = TRUE, fill = TRUE))
@@ -82,7 +73,7 @@ pull_range <- function(start, end, season) {
   if (nrow(dt) >= ROW_CAP) warning("Single-day pull hit the row cap: ", format(start))
   drop <- intersect(DROP_COLS, names(dt))
   if (length(drop)) dt[, (drop) := NULL]
-  if (end < Sys.Date() - 2L) saveRDS(dt, f)            # don't cache days that may still be filling in
+  if (end < Sys.Date() - 2L) saveRDS(dt, f)
   dt
 }
 
@@ -117,9 +108,7 @@ if (file.exists(RAW_FILE) && !REFRESH) {
 }
 setDT(sc)
 
-# =====================================================================================
-# (B) TYPES + EXPLORATION-ONLY FEATURES
-# =====================================================================================
+# types & exploration features
 REQUIRED <- c("pitch_type", "pitch_name", "game_date", "game_year", "game_pk", "at_bat_number", "pitch_number",
               "pitcher", "batter", "p_throws", "stand", "release_speed", "release_spin_rate",
               "spin_axis", "release_extension", "release_pos_x", "release_pos_y", "release_pos_z",
@@ -147,8 +136,7 @@ for (cc in NUM_COLS) if (!is.double(sc[[cc]])) set(sc, j = cc, value = suppressW
 for (cc in c("zone", "balls", "strikes", "game_year"))
   if (!is.integer(sc[[cc]])) set(sc, j = cc, value = suppressWarnings(as.integer(sc[[cc]])))
 
-# Transverse (active) spin from the Magnus acceleration (Nathan). Sea-level air density assumed,
-# so altitude parks will read low.
+  
 spin_physics <- function(vx0, vy0, vz0, ax, ay, az, K = 5.383e-3, g = 32.174) {
   vyf <- -sqrt(pmax(vy0^2 - 2 * ay * (50 - 17 / 12), 0))
   tf  <- (vyf - vy0) / ay
@@ -164,17 +152,17 @@ spin_physics <- function(vx0, vy0, vz0, ax, ay, az, K = 5.383e-3, g = 32.174) {
   vxf <- vx0 + ax * tf; vzf <- vz0 + az * tf
   list(spin_t = 78.92 * s * vb,
        vaa    = -atan(vzf / vyf) * 180 / pi,
-       haa_x  = atan(vxf / -vyf) * 180 / pi)       # + = toward catcher's right
+       haa_x  = atan(vxf / -vyf) * 180 / pi)
 }
 
 sc[, sgn := fifelse(p_throws == "R", 1, -1)]
 ph <- sc[, spin_physics(vx0, vy0, vz0, ax, ay, az)]
 sc[, `:=`(
-  hb          = -12 * pfx_x,                         # pitcher's view, inches (+ = RHP arm side)
+  hb          = -12 * pfx_x,
   ivb         =  12 * pfx_z,
-  hb_arm      = -12 * pfx_x * sgn,                   # + = arm side for both hands
-  rel_x_arm   = -release_pos_x * sgn,                # + = arm side
-  spin_axis_m = 180 + sgn * (spin_axis - 180),       # LHP mirrored onto RHP convention
+  hb_arm      = -12 * pfx_x * sgn,
+  rel_x_arm   = -release_pos_x * sgn,
+  spin_axis_m = 180 + sgn * (spin_axis - 180),
   spin_t_est   = ph$spin_t,
   spin_eff_est = ph$spin_t / release_spin_rate,
   vaa          = ph$vaa,
@@ -182,8 +170,8 @@ sc[, `:=`(
 )]
 rm(ph)
 sc[!is.finite(spin_eff_est) | spin_eff_est > 2, spin_eff_est := NA_real_]
-sc[, axis_inf_m := 180 + sgn * (((atan2(-pfx_x, pfx_z) * 180 / pi + 180) %% 360) - 180)]  # movement-implied axis
-sc[, axis_dev   := ((spin_axis_m - axis_inf_m + 180) %% 360) - 180]                       # measured - implied
+sc[, axis_inf_m := 180 + sgn * (((atan2(-pfx_x, pfx_z) * 180 / pi + 180) %% 360) - 180)]
+sc[, axis_dev   := ((spin_axis_m - axis_inf_m + 180) %% 360) - 180]
 sc[, `:=`(sin_ax = sin(spin_axis_m * pi / 180), cos_ax = cos(spin_axis_m * pi / 180))]
 
 swing_desc <- c("swinging_strike", "swinging_strike_blocked", "foul", "foul_tip", "hit_into_play")
@@ -199,9 +187,7 @@ sc[, `:=`(
   same_hand     = stand == p_throws
 )]
 
-# =====================================================================================
-# (C) REPORT
-# =====================================================================================
+# report
 options(width = 220, scipen = 999, datatable.print.class = FALSE)
 hdr  <- function(x) cat("\n\n", strrep("=", 110), "\n", x, "\n", strrep("=", 110), "\n", sep = "")
 sub_ <- function(x) cat("\n--- ", x, " ---\n", sep = "")
@@ -224,7 +210,7 @@ qtab <- function(vars, by, rows = TRUE) {
     out
   }), use.names = TRUE)
 }
-sec <- function(title, expr) {                      # one failing section never kills the report
+sec <- function(title, expr) {
   hdr(title)
   tryCatch(expr, error = function(e) cat("!! SECTION FAILED:", conditionMessage(e), "\n"))
   invisible(NULL)
@@ -481,7 +467,7 @@ run_report <- function() {
 }
 run_report()
 
-# ----------------------------------- PLOTS ------------------------------------------
+# plots
 tryCatch({
   idx <- which(is_main & !is.na(sc$hb_arm) & !is.na(sc$ivb))
   idx <- idx[sample.int(length(idx), min(length(idx), 400000L))]
